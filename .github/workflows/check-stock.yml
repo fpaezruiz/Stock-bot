@@ -3,7 +3,7 @@ name: Revisar stock
 on:
   schedule:
     # Cada 15 minutos (hora UTC). GitHub puede retrasar unos minutos las ejecuciones.
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
   # Permite ejecutarlo a mano desde la pestaña "Actions"
   workflow_dispatch:
 
