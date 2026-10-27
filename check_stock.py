@@ -33,6 +33,11 @@ USER_AGENT = (
 JSONLD_RE = re.compile(r'"availability"\s*:\s*"https?://schema\.org/(\w+)"', re.I)
 META_RE = re.compile(r'property="product:availability"\s+content="([^"]+)"', re.I)
 PRICE_RE = re.compile(r'property="product:price:amount"\s+content="(\d+)"', re.I)
+# El botón "Agregar al carro" llama a agregarCarro('{UID}'), que hace un GET a CART_ADD_URL.
+# Al abrir ese link en tu navegador, el producto se agrega a TU carro (tu sesión).
+CART_UID_RE = re.compile(r"agregarCarro\('(\{[0-9A-F-]+\})'\)", re.I)
+CART_ADD_URL = "https://www.todojuegos.cl/CarroCompra/Carro_Agregar/?uidProducto={uid}"
+CART_URL = "https://www.todojuegos.cl/CarroCompra/"
 
 IN_STOCK_VALUES = {"instock", "in stock", "preorder", "presale", "limitedavailability"}
 
@@ -56,7 +61,7 @@ def fetch(url):
 
 
 def check_product(url):
-    """Devuelve (disponible: bool, estado_texto: str, precio: str|None)."""
+    """Devuelve (disponible, estado_texto, precio, link_agregar_al_carro)."""
     html = fetch(url)
 
     match = JSONLD_RE.search(html) or META_RE.search(html)
@@ -68,7 +73,10 @@ def check_product(url):
 
     price_match = PRICE_RE.search(html)
     price = price_match.group(1) if price_match else None
-    return available, status, price
+
+    uid_match = CART_UID_RE.search(html)
+    cart_link = CART_ADD_URL.format(uid=uid_match.group(1)) if uid_match else None
+    return available, status, price, cart_link
 
 
 def send_telegram(text):
@@ -135,7 +143,7 @@ def main():
         name, url = product["name"], product["url"]
         print(f"- {name}")
         try:
-            available, status, price = check_product(url)
+            available, status, price, cart_link = check_product(url)
         except Exception as exc:
             print(f"  [!] Error revisando el producto: {exc}")
             errors += 1
@@ -146,11 +154,17 @@ def main():
 
         # Solo avisamos cuando cambia de "sin stock" a "disponible" para no hacer spam.
         if available and not was_available:
-            send_telegram(
+            message = (
                 f"🟢 ¡{name} está DISPONIBLE!\n"
                 f"Precio: {format_price(price)}\n\n"
-                f"{url}"
+                f"Ver producto:\n{url}"
             )
+            if cart_link:
+                message += (
+                    f"\n\n🛒 Agregar al carro (1 toque):\n{cart_link}"
+                    f"\n\n💳 Ir al carro a pagar:\n{CART_URL}"
+                )
+            send_telegram(message)
             print("  -> Aviso enviado por Telegram")
         elif not available and was_available:
             print("  -> Volvió a quedar sin stock")
