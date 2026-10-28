@@ -27,19 +27,21 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-# La página publica el estado en el JSON-LD de schema.org y en una meta etiqueta:
+# La página publica un estado en el JSON-LD de schema.org y en una meta etiqueta:
 #   "availability": "https://schema.org/OutOfStock"
 #   <meta property="product:availability" content="out of stock">
+# OJO: ese estado puede decir "InStock" antes de que la tienda habilite la compra,
+# así que solo se muestra como información; NO decide si avisar.
 JSONLD_RE = re.compile(r'"availability"\s*:\s*"https?://schema\.org/(\w+)"', re.I)
 META_RE = re.compile(r'property="product:availability"\s+content="([^"]+)"', re.I)
 PRICE_RE = re.compile(r'property="product:price:amount"\s+content="(\d+)"', re.I)
-# El botón "Agregar al carro" llama a agregarCarro('{UID}'), que hace un GET a CART_ADD_URL.
-# Al abrir ese link en tu navegador, el producto se agrega a TU carro (tu sesión).
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# Lo que realmente indica que se puede comprar es el botón "Agregar al carro", que llama a
+# agregarCarro('{UID}'). Ese UID arma CART_ADD_URL: al abrir el link en tu navegador,
+# el producto se agrega a TU carro (tu sesión).
 CART_UID_RE = re.compile(r"agregarCarro\('(\{[0-9A-F-]+\})'\)", re.I)
 CART_ADD_URL = "https://www.todojuegos.cl/CarroCompra/Carro_Agregar/?uidProducto={uid}"
 CART_URL = "https://www.todojuegos.cl/CarroCompra/"
-
-IN_STOCK_VALUES = {"instock", "in stock", "preorder", "presale", "limitedavailability"}
 
 
 def load_env_file():
@@ -61,22 +63,22 @@ def fetch(url):
 
 
 def check_product(url):
-    """Devuelve (disponible, estado_texto, precio, link_agregar_al_carro)."""
+    """Devuelve (estado_texto, precio, link_agregar_al_carro o None si no hay botón)."""
     html = fetch(url)
 
+    # Si no viene la ficha del producto, la página falló (no significa "agotado").
     match = JSONLD_RE.search(html) or META_RE.search(html)
     if not match:
-        raise RuntimeError("No se encontró el estado de disponibilidad en la página")
-
+        raise RuntimeError("No se encontró la información del producto en la página")
     status = match.group(1).strip()
-    available = status.lower() in IN_STOCK_VALUES
 
     price_match = PRICE_RE.search(html)
     price = price_match.group(1) if price_match else None
 
-    uid_match = CART_UID_RE.search(html)
+    # Se ignoran los botones comentados en el HTML (la tienda deja algunos desactivados así).
+    uid_match = CART_UID_RE.search(HTML_COMMENT_RE.sub("", html))
     cart_link = CART_ADD_URL.format(uid=uid_match.group(1)) if uid_match else None
-    return available, status, price, cart_link
+    return status, price, cart_link
 
 
 def send_telegram(text):
@@ -143,33 +145,43 @@ def main():
         name, url = product["name"], product["url"]
         print(f"- {name}")
         try:
-            available, status, price, cart_link = check_product(url)
+            status, price, cart_link = check_product(url)
         except Exception as exc:
             print(f"  [!] Error revisando el producto: {exc}")
             errors += 1
             continue
 
-        print(f"  Estado: {status} | Precio: {format_price(price)}")
-        was_available = state.get(url, False)
+        can_buy = cart_link is not None
+        print(
+            f"  Estado: {status} | Precio: {format_price(price)} | "
+            f"Botón carro: {'SÍ' if can_buy else 'NO'}"
+        )
 
-        # Solo avisamos cuando cambia de "sin stock" a "disponible" para no hacer spam.
-        if available and not was_available:
-            message = (
-                f"🟢 ¡{name} está DISPONIBLE!\n"
+        # El estado guarda {"can_buy": bool}. Versiones anteriores guardaban solo true/false
+        # según el "InStock" de la página; eso no sirve, así que se toma como "no comprable"
+        # (y no se avisa "agotado" por ese cambio de formato).
+        previous = state.get(url)
+        could_buy = previous.get("can_buy", False) if isinstance(previous, dict) else False
+
+        # Solo avisamos cuando cambia el estado, para no hacer spam.
+        if can_buy and not could_buy:
+            send_telegram(
+                f"🟢 ¡{name} ya se puede AGREGAR AL CARRO!\n"
                 f"Precio: {format_price(price)}\n\n"
+                f"🛒 Agregar al carro (1 toque):\n{cart_link}\n\n"
+                f"💳 Ir al carro a pagar:\n{CART_URL}\n\n"
                 f"Ver producto:\n{url}"
             )
-            if cart_link:
-                message += (
-                    f"\n\n🛒 Agregar al carro (1 toque):\n{cart_link}"
-                    f"\n\n💳 Ir al carro a pagar:\n{CART_URL}"
-                )
-            send_telegram(message)
-            print("  -> Aviso enviado por Telegram")
-        elif not available and was_available:
-            print("  -> Volvió a quedar sin stock")
+            print("  -> Aviso de disponibilidad enviado por Telegram")
+        elif not can_buy and could_buy:
+            send_telegram(
+                f"🔴 {name} se AGOTÓ\n"
+                f"(ya no aparece el botón \"Agregar al carro\")\n\n"
+                f"Te avisaré si vuelve a estar disponible.\n{url}"
+            )
+            print("  -> Aviso de agotado enviado por Telegram")
 
-        new_state[url] = available
+        new_state[url] = {"can_buy": can_buy}
 
     if new_state != state:
         STATE_FILE.write_text(json.dumps(new_state, indent=2) + "\n", encoding="utf-8")
